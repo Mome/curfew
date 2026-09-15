@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# curfew — apply an hblock website-blocking profile, then lock yourself out of
+# sudo via nosudo so the block can't be undone before it lifts.
+#
+# hblock's blocklist is written to the TOP of /etc/hosts, with your existing
+# /etc/hosts content preserved verbatim below it (via hblock's -F/--footer,
+# which includes the file as-is with no parsing). Since /etc/hosts resolution
+# honors the first matching entry for a given name, the blocklist wins for
+# any domain you'd already mapped yourself, while everything else you had
+# stays intact for the curfew's duration. curfew backs up the original
+# /etc/hosts first and restores it automatically when the curfew ends via its
+# own reboot-safe systemd timer — the same pattern nosudo itself uses to
+# restore sudo (see scheduler.py). Only one curfew hosts-block can be active
+# at a time, since /etc/hosts is a single system-wide file.
+#
+# Profiles live in $CURFEW_PROFILES_DIR (default: ~/.config/curfew/profiles/<name>/)
+# and are plain hblock input files:
+#   sources.list  — blocklist URLs, one per line (hblock -S)
+#   deny.list     — your own domains to block, one per line (hblock -D)
+#   allow.list    — exceptions, one per line (hblock -A)
+#   parents.list  — names of other profiles to inherit from, one per line
+# All four are optional; a missing sources/deny/allow file across the whole
+# inheritance chain means "use hblock's default" is NOT passed for that piece
+# (hblock falls back to its own built-in/config lookup, not an empty list) —
+# see `curfew --new` for a scaffold with empty (not missing) files, which
+# does pass an explicit empty list.
+#
+# Profile lookup checks $CURFEW_PROFILES_DIR first, then the bundled profiles
+# shipped alongside this script in ./profiles/ (see BUILTIN_PROFILES_DIR) — a
+# user profile of the same name shadows a bundled one. Inheritance
+# (parents.list) is live: editing a parent profile later affects every
+# profile that inherits from it, since the chain is resolved fresh on every
+# `curfew <profile> --for/--until`.
+
+set -euo pipefail
+
+PROFILES_DIR="${CURFEW_PROFILES_DIR:-$HOME/.config/curfew/profiles}"
+
+# Resolve the script's own real directory (following symlinks), so bundled
+# profiles work when invoked by repo path without needing to be installed as
+# a package.
+_curfew_source="${BASH_SOURCE[0]}"
+while [[ -L "$_curfew_source" ]]; do
+  _curfew_dir="$(cd -P "$(dirname "$_curfew_source")" >/dev/null 2>&1 && pwd)"
+  _curfew_source="$(readlink "$_curfew_source")"
+  [[ "$_curfew_source" != /* ]] && _curfew_source="$_curfew_dir/$_curfew_source"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_curfew_source")" >/dev/null 2>&1 && pwd)"
+unset _curfew_source _curfew_dir
+
+BUILTIN_PROFILES_DIR="${CURFEW_BUILTIN_PROFILES_DIR:-$SCRIPT_DIR/profiles}"
+
+# Where the pre-curfew /etc/hosts and the restore timer's own files live.
+STATE_DIR="/var/lib/curfew"
+HOSTS_BACKUP="$STATE_DIR/hosts.bak"
+RESTORE_SCRIPT="$STATE_DIR/restore-hosts.sh"
+SYSTEMD_DIR="/etc/systemd/system"
+RESTORE_SERVICE="curfew-restore-hosts.service"
+RESTORE_TIMER="curfew-restore-hosts.timer"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  curfew <profile> --for <duration>     Apply profile, lock sudo for a duration (e.g. 2h, 90m)
+  curfew <profile> --until <time>       Apply profile, lock sudo until an absolute time
+  curfew --list                         List available profiles (yours, then bundled)
+  curfew --new <profile> [--from a,b,c] Scaffold a new profile, optionally inheriting others
+  curfew --help                         Show this help
+
+Profiles directory: $CURFEW_PROFILES_DIR (default: ~/.config/curfew/profiles)
+Bundled profiles:   ./profiles/ next to this script (see --list)
+Each profile is a directory containing any of: sources.list, deny.list, allow.list, parents.list
+EOF
+}
+
+# -- profile resolution & inheritance ---------------------------------------
+
+# Reads a parents.list-style file, stripping comments/blanks, one name per
+# output line. Never fails: prints nothing for a missing/empty file.
+list_parents() {
+  local parents_file="$1"
+  [[ -f "$parents_file" ]] || return 0
+  sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$parents_file" \
+    | grep -v '^$' || true
+}
+
+# Looks up a profile by name: user profiles first, bundled profiles second.
+# Prints the resolved directory and returns 0, or prints a clear error to
+# stderr and returns 1 (never exits, so it composes in command substitution).
+resolve_profile_dir() {
+  local name="$1" context="${2:-}"
+  if [[ -d "$PROFILES_DIR/$name" ]]; then
+    printf '%s\n' "$PROFILES_DIR/$name"
+    return 0
+  fi
+  if [[ -d "$BUILTIN_PROFILES_DIR/$name" ]]; then
+    printf '%s\n' "$BUILTIN_PROFILES_DIR/$name"
+    return 0
+  fi
+  echo "curfew: unknown profile '$name'${context:+ ($context)} — looked in:" >&2
+  echo "curfew:   $PROFILES_DIR/$name" >&2
+  echo "curfew:   $BUILTIN_PROFILES_DIR/$name" >&2
+  return 1
+}
+
+# resolve_profile_chain <name>: walks parents.list recursively (DFS),
+# dedupes diamond-inherited ancestors, and detects cycles. Prints the
+# resolved chain of profile directories, ancestors-before-self, one per
+# line; returns 1 with a clear error on a cycle or an unresolvable parent.
+#
+# IMPORTANT: call this via command substitution ($(...)), never process
+# substitution (< <(...)) — a failure inside a process substitution's
+# subshell is invisible to the caller's `set -e`/exit-status check, so a
+# cycle would be silently swallowed instead of aborting the script.
+declare -A _chain_visited
+declare -A _chain_in_progress
+_chain_result=()
+
+resolve_profile_chain() {
+  _chain_visited=()
+  _chain_in_progress=()
+  _chain_result=()
+  _walk_profile_chain "$1" "" || return 1
+  printf '%s\n' "${_chain_result[@]}"
+}
+
+_walk_profile_chain() {
+  local name="$1" path_so_far="$2" dir parent
+
+  if [[ -n "${_chain_in_progress[$name]:-}" ]]; then
+    echo "curfew: cycle detected in profile inheritance: ${path_so_far}${path_so_far:+ -> }$name" >&2
+    return 1
+  fi
+  [[ -n "${_chain_visited[$name]:-}" ]] && return 0
+
+  _chain_in_progress[$name]=1
+  dir="$(resolve_profile_dir "$name" "${path_so_far:+referenced from $path_so_far}")" || return 1
+
+  while IFS= read -r parent; do
+    [[ -z "$parent" ]] && continue
+    _walk_profile_chain "$parent" "${path_so_far:+$path_so_far -> }$name" || return 1
+  done < <(list_parents "$dir/parents.list")
+
+  unset '_chain_in_progress[$name]'
+  _chain_visited[$name]=1
+  _chain_result+=("$dir")
+}
+
+# merge_profile_lists <out> <kind> <dir>...: concatenates <kind>
+# (sources.list|deny.list|allow.list) across every given profile dir into
+# <out>. Returns 0 (caller should then pass the corresponding hblock flag)
+# iff at least one dir has the file — even if empty — matching the existing
+# single-profile "missing file omits the flag, empty file passes it"
+# semantics extended to a whole inheritance chain.
+merge_profile_lists() {
+  local out="$1" kind="$2"; shift 2
+  local dir any_file_present=0
+  : > "$out"
+  for dir in "$@"; do
+    [[ -f "$dir/$kind" ]] || continue
+    any_file_present=1
+    if [[ -s "$dir/$kind" ]]; then
+      printf '# from profile: %s\n' "$(basename "$dir")" >> "$out"
+      cat "$dir/$kind" >> "$out"
+      printf '\n' >> "$out"
+    fi
+  done
+  [[ "$any_file_present" -eq 1 ]]
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# -- commands ----------------------------------------------------------------
+
+describe_profile_dir() {
+  local dir="$1" name parts=() parents_arr
+  name="$(basename "$dir")"
+  [[ -f "$dir/sources.list" ]] && parts+=("sources")
+  [[ -f "$dir/deny.list" ]] && parts+=("deny")
+  [[ -f "$dir/allow.list" ]] && parts+=("allow")
+  printf '  %-20s %s\n' "$name" "${parts[*]:-<empty>}"
+  mapfile -t parents_arr < <(list_parents "$dir/parents.list")
+  [[ "${#parents_arr[@]}" -gt 0 ]] && printf '  %-20s   from: %s\n' "" "${parents_arr[*]}"
+  return 0
+}
+
+cmd_list() {
+  local dir
+
+  if [[ ! -d "$PROFILES_DIR" ]] || [[ -z "$(ls -A "$PROFILES_DIR" 2>/dev/null)" ]]; then
+    echo "curfew: no profiles yet in $PROFILES_DIR (create one with: curfew --new <name>)"
+  else
+    echo "Profiles in $PROFILES_DIR:"
+    for dir in "$PROFILES_DIR"/*/; do
+      [[ -d "$dir" ]] || continue
+      describe_profile_dir "$dir"
+    done
+  fi
+
+  if [[ -d "$BUILTIN_PROFILES_DIR" ]] && [[ -n "$(ls -A "$BUILTIN_PROFILES_DIR" 2>/dev/null)" ]]; then
+    echo
+    echo "Bundled profiles (inherit from these via --from; in $BUILTIN_PROFILES_DIR):"
+    for dir in "$BUILTIN_PROFILES_DIR"/*/; do
+      [[ -d "$dir" ]] || continue
+      describe_profile_dir "$dir"
+    done
+  fi
+}
+
+cmd_new() {
+  local name="$1" from_csv="${2:-}"
+  local dir="$PROFILES_DIR/$name"
+
+  if [[ -e "$dir" ]]; then
+    echo "curfew: profile '$name' already exists at $dir" >&2
+    exit 1
+  fi
+
+  local -a parent_names=()
+  if [[ -n "$from_csv" ]]; then
+    IFS=',' read -ra parent_names <<<"$from_csv"
+    local i p
+    for i in "${!parent_names[@]}"; do
+      p="$(trim "${parent_names[i]}")"
+      [[ -n "$p" ]] || { echo "curfew: --from has an empty profile name (check for stray commas)" >&2; exit 1; }
+      parent_names[i]="$p"
+      resolve_profile_dir "$p" "named in --from for '$name'" >/dev/null || exit 1
+    done
+  fi
+
+  if [[ -d "$BUILTIN_PROFILES_DIR/$name" ]]; then
+    echo "curfew: note: '$name' will shadow the bundled profile of the same name" >&2
+  fi
+
+  mkdir -p "$dir"
+  : > "$dir/sources.list"
+  : > "$dir/deny.list"
+  : > "$dir/allow.list"
+  if [[ "${#parent_names[@]}" -gt 0 ]]; then
+    printf '%s\n' "${parent_names[@]}" > "$dir/parents.list"
+  else
+    : > "$dir/parents.list"
+  fi
+
+  echo "curfew: created profile '$name' at $dir"
+  [[ "${#parent_names[@]}" -gt 0 ]] && echo "  inherits from: ${parent_names[*]}"
+  echo "  edit sources.list, deny.list, allow.list, parents.list"
+}
+
+cmd_apply() {
+  local profile="$1"
+  shift
+
+  resolve_profile_dir "$profile" >/dev/null || { cmd_list >&2; exit 1; }
+
+  if [[ $# -eq 0 ]]; then
+    echo "curfew: need --for <duration> or --until <time> (see: curfew --help)" >&2
+    exit 1
+  fi
+
+  local chain_output
+  chain_output="$(resolve_profile_chain "$profile")" || exit 1
+  local -a chain_dirs
+  mapfile -t chain_dirs <<<"$chain_output"
+
+  local merge_dir
+  merge_dir="$(mktemp -d "${TMPDIR:-/tmp}/curfew.XXXXXX")"
+  trap 'rm -rf "$merge_dir"' EXIT
+
+  local hblock_args=()
+  merge_profile_lists "$merge_dir/sources.list" sources.list "${chain_dirs[@]}" \
+    && hblock_args+=(-S "$merge_dir/sources.list")
+  merge_profile_lists "$merge_dir/deny.list" deny.list "${chain_dirs[@]}" \
+    && hblock_args+=(-D "$merge_dir/deny.list")
+  merge_profile_lists "$merge_dir/allow.list" allow.list "${chain_dirs[@]}" \
+    && hblock_args+=(-A "$merge_dir/allow.list")
+
+  if sudo test -f "$HOSTS_BACKUP"; then
+    echo "curfew: a curfew hosts-block is already active ($HOSTS_BACKUP exists);" >&2
+    echo "curfew: refusing to apply another profile on top of it — wait for it" >&2
+    echo "curfew: to lift, or restore manually with: sudo cp $HOSTS_BACKUP /etc/hosts" >&2
+    exit 1
+  fi
+
+  local target_user
+  target_user="$(resolve_target_user "$@")"
+
+  echo "curfew: backing up /etc/hosts to $HOSTS_BACKUP..."
+  sudo mkdir -p "$STATE_DIR"
+  sudo cp -p /etc/hosts "$HOSTS_BACKUP"
+
+  # -F (footer) appends the pre-curfew /etc/hosts verbatim, below the
+  # blocklist, so it's preserved while the blocklist still wins on conflicts
+  # (see the file-header comment for why).
+  hblock_args+=(-O /etc/hosts -H none -F "$HOSTS_BACKUP")
+
+  echo "curfew: applying profile '$profile' via hblock..."
+  if ! sudo hblock "${hblock_args[@]}"; then
+    echo "curfew: hblock failed; removing hosts backup" >&2
+    sudo rm -f "$HOSTS_BACKUP"
+    exit 1
+  fi
+
+  echo "curfew: locking sudo via nosudo..."
+  if ! nosudo restrict "$@"; then
+    echo "curfew: nosudo restrict failed; reverting /etc/hosts" >&2
+    sudo cp -f "$HOSTS_BACKUP" /etc/hosts
+    sudo rm -f "$HOSTS_BACKUP"
+    exit 1
+  fi
+
+  echo "curfew: scheduling automatic /etc/hosts restore..."
+  install_hosts_restore_timer "$target_user"
+}
+
+# Best-effort match for nosudo's own user resolution (arg, else SUDO_USER,
+# else invoking user) so the restore timer is keyed off the same lift time
+# `nosudo restrict "$@"` just computed.
+resolve_target_user() {
+  local first="${1:-}"
+  if [[ -n "$first" && "$first" != --* ]]; then
+    printf '%s\n' "$first"
+  else
+    printf '%s\n' "${SUDO_USER:-$(id -un)}"
+  fi
+}
+
+# Installs a reboot-safe systemd timer that restores $HOSTS_BACKUP over
+# /etc/hosts at the user's nosudo lift time, then cleans up after itself —
+# the same pattern nosudo uses to restore sudo (see scheduler.py).
+install_hosts_restore_timer() {
+  local user="$1"
+  local status_line lift_at
+
+  status_line="$(nosudo status | grep "^${user}: " || true)"
+  if [[ -z "$status_line" ]]; then
+    echo "curfew: could not read nosudo's lift time for '$user';" >&2
+    echo "curfew: /etc/hosts restore was NOT scheduled — restore it yourself" >&2
+    echo "curfew: when the curfew ends with: sudo cp $HOSTS_BACKUP /etc/hosts" >&2
+    return 1
+  fi
+  lift_at="$(sed -E 's/.*lifts at ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) .*/\1/' <<<"$status_line")"
+
+  sudo tee "$RESTORE_SCRIPT" >/dev/null <<EOF
+#!/bin/sh
+# Managed by curfew. Restores /etc/hosts to its pre-curfew contents. Root-owned; do not edit.
+cp -f $HOSTS_BACKUP /etc/hosts
+systemctl stop $RESTORE_TIMER 2>/dev/null || true
+systemctl disable $RESTORE_TIMER 2>/dev/null || true
+rm -f $SYSTEMD_DIR/$RESTORE_TIMER $SYSTEMD_DIR/$RESTORE_SERVICE
+rm -f $HOSTS_BACKUP $RESTORE_SCRIPT
+systemctl daemon-reload 2>/dev/null || true
+EOF
+  sudo chown root:root "$RESTORE_SCRIPT"
+  sudo chmod 700 "$RESTORE_SCRIPT"
+
+  sudo tee "$SYSTEMD_DIR/$RESTORE_SERVICE" >/dev/null <<EOF
+[Unit]
+Description=curfew: restore /etc/hosts after curfew ends
+
+[Service]
+Type=oneshot
+ExecStart=$RESTORE_SCRIPT
+EOF
+
+  sudo tee "$SYSTEMD_DIR/$RESTORE_TIMER" >/dev/null <<EOF
+[Unit]
+Description=curfew: restore timer for /etc/hosts
+
+[Timer]
+OnCalendar=$lift_at:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$RESTORE_TIMER"
+  sudo systemctl restart "$RESTORE_TIMER"
+
+  echo "curfew: /etc/hosts will be restored automatically at $lift_at"
+}
+
+main() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    usage
+    exit 0
+  fi
+
+  case "$1" in
+    --list)
+      cmd_list
+      ;;
+    --new)
+      [[ $# -ge 2 ]] || { echo "curfew: --new needs a profile name" >&2; exit 1; }
+      local new_name="$2" new_from=""
+      if [[ "${3:-}" == "--from" ]]; then
+        [[ $# -ge 4 ]] || { echo "curfew: --from needs a comma-separated list of profile names" >&2; exit 1; }
+        new_from="$4"
+      elif [[ $# -gt 2 ]]; then
+        echo "curfew: unknown extra argument(s) after profile name: ${*:3}" >&2
+        exit 1
+      fi
+      cmd_new "$new_name" "$new_from"
+      ;;
+    --*)
+      echo "curfew: unknown option '$1'" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      cmd_apply "$@"
+      ;;
+  esac
+}
+
+main "$@"
