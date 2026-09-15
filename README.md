@@ -43,6 +43,20 @@ source ~/repos/curfew/completions/curfew.bash   # or wherever this repo lives
 It completes profile names (yours and bundled), `--list`/`--new`/`--help`, `--for`/`--until` after
 a profile, and `--from` after `curfew --new <name>`.
 
+### Shell completion (fish)
+
+`make install` also symlinks `completions/curfew.fish` into
+`~/.config/fish/completions/curfew.fish`, which fish auto-loads — no sourcing or extra package
+needed. Without running `make install`, source it directly instead:
+
+```fish
+source ~/repos/curfew/completions/curfew.fish   # or wherever this repo lives
+```
+
+Same coverage as the bash completion: profile names (yours and bundled),
+`--list`/`--new`/`--help`, `--for`/`--until` after a profile, and `--from` after `curfew --new
+<name>`.
+
 ## 1. Compose a profile from bundled profiles
 
 The fastest way to start is to **inherit** from the profiles bundled with curfew — see `curfew
