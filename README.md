@@ -20,18 +20,56 @@ is enough:
 ln -s "$(pwd)/curfew" ~/.local/bin/curfew   # from inside this repo; ~/.local/bin must be on PATH
 ```
 
+or, equivalently, via the bundled Makefile:
+
+```sh
+make install      # symlinks curfew into ~/.local/bin (override with PREFIX=...)
+```
+
 Update by `git pull`ing this repo — the symlink always points at the current checkout, no
-reinstall needed. To uninstall: `rm ~/.local/bin/curfew`.
+reinstall needed. To uninstall:
 
-## 1. Create a profile
+```sh
+rm ~/.local/bin/curfew   # or: make uninstall
+```
 
-A profile is just a directory of plain-text lists. Scaffold one:
+This removes only the installed symlink — your profiles in `~/.config/curfew` are left alone. To
+also delete them, use `make purge` instead of `make uninstall`.
+
+## 1. Compose a profile from bundled profiles
+
+The fastest way to start is to **inherit** from the profiles bundled with curfew — see `curfew
+--list`'s "Bundled profiles" section (sourced from `./profiles/` next to the script: `reddit`,
+`video`, `news`, `shopping`, `games`, `social-media`, `entertainment`, and more):
+
+```sh
+curfew --new work --from entertainment,news,shopping
+```
+
+This creates `~/.config/curfew/profiles/work/parents.list` — one profile name per line, `#`
+comments allowed. **Inheritance is live**: at apply time, curfew resolves the full chain of
+parents (and their own parents, and so on) and merges everyone's `sources.list`/`deny.list`/
+`allow.list` together — so `entertainment` here pulls in `games`, `memes`, `reddit`,
+`social-media`, `sports`, and `video` automatically, and if you (or a future update) edits any of
+those later, `work` picks up the change without needing to be recreated.
+
+A user profile of the same name as a bundled one shadows it (your own `~/.config/curfew/profiles/`
+is checked before the bundled `profiles/` directory) — useful if you want to fully customize a
+bundled profile without giving up its name.
+
+Use `curfew --list` any time to see what profiles exist, which list files each one has, and what
+they inherit from.
+
+## 2. Create a custom profile
+
+Prefer to curate your own domains, or nothing bundled fits? Scaffold an empty profile:
 
 ```sh
 curfew --new focus
 ```
 
-This creates `~/.config/curfew/profiles/focus/` with three empty files:
+This creates `~/.config/curfew/profiles/focus/` with three empty files (plus the `parents.list`
+inheritance file from above — four in total):
 
 ```
 sources.list   # blocklist URLs, one per line — fed to hblock -S
@@ -53,33 +91,8 @@ echo "reddit.com" >> ~/.config/curfew/profiles/focus/deny.list
 echo "news.ycombinator.com" >> ~/.config/curfew/profiles/focus/deny.list
 ```
 
-Use `curfew --list` any time to see what profiles exist and which list files each one has:
-
-```sh
-curfew --list
-```
-
-## 2. Compose profiles with inheritance
-
-Rather than curating every list by hand, a profile can **inherit** from one or more other
-profiles — your own, or one of the profiles bundled with curfew (see `curfew --list`'s "Bundled
-profiles" section, sourced from `./profiles/` next to the script: `reddit`, `youtube`, `news-en`,
-`news-de`, `shopping`, `games`, `social-media`, and more).
-
-```sh
-curfew --new work --from reddit,news-en,shopping,games
-```
-
-This writes the given names to the new profile's `parents.list` (a fourth optional file, one
-profile name per line, `#` comments allowed like the other three). **Inheritance is live**: at
-apply time, curfew resolves the full chain of parents (and their own parents, and so on) and
-merges everyone's `sources.list`/`deny.list`/`allow.list` together — so if you (or a future
-update) edits a bundled profile like `news-en` later, `work` picks up that change automatically,
-without needing to be recreated.
-
-A user profile of the same name as a bundled one shadows it (your own `~/.config/curfew/profiles/`
-is checked before the bundled `profiles/` directory) — useful if you want to fully customize a
-bundled profile without giving up its name.
+Combine both approaches freely — a hand-curated profile can also carry its own `parents.list` to
+inherit from bundled or other user profiles.
 
 ## 3. Apply it
 
