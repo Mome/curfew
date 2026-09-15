@@ -13,28 +13,35 @@ you can't undo the block early. This walks through setting up and running your f
 ## Installation
 
 There's no packaging/build step — `curfew` is a single script that finds its bundled `profiles/`
-directory relative to its own real location (following symlinks), so a symlink onto your `PATH`
-is enough:
-
-```sh
-ln -s "$(pwd)/curfew" ~/.local/bin/curfew   # from inside this repo; ~/.local/bin must be on PATH
-```
-
-or, equivalently, via the bundled Makefile:
+directory relative to its own real location (following symlinks), so installing it is just a
+symlink onto your `PATH`, managed via the bundled Makefile:
 
 ```sh
 make install      # symlinks curfew into ~/.local/bin (override with PREFIX=...)
 ```
 
 Update by `git pull`ing this repo — the symlink always points at the current checkout, no
-reinstall needed. To uninstall:
+reinstall needed.
 
 ```sh
-rm ~/.local/bin/curfew   # or: make uninstall
+make uninstall     # removes the installed symlink only — profiles in ~/.config/curfew are kept
+make purge         # uninstall, plus deletes ~/.config/curfew (your profiles)
 ```
 
-This removes only the installed symlink — your profiles in `~/.config/curfew` are left alone. To
-also delete them, use `make purge` instead of `make uninstall`.
+### Shell completion (bash)
+
+`make install` also symlinks `completions/curfew.bash` into
+`~/.local/share/bash-completion/completions/curfew`, which the
+[bash-completion](https://github.com/scop/bash-completion) package auto-loads per-command in new
+shells. If you don't have `bash-completion` set up, source it directly instead, e.g. in
+`~/.bashrc`:
+
+```sh
+source ~/repos/curfew/completions/curfew.bash   # or wherever this repo lives
+```
+
+It completes profile names (yours and bundled), `--list`/`--new`/`--help`, `--for`/`--until` after
+a profile, and `--from` after `curfew --new <name>`.
 
 ## 1. Compose a profile from bundled profiles
 
