@@ -8,7 +8,20 @@ you can't undo the block early. This walks through setting up and running your f
 
 - `nosudo` installed and on your `PATH`.
 - `hblock` installed and on your `PATH`.
-- `curfew` itself on your `PATH` (or run it by path, e.g. `./curfew`).
+- `curfew` itself on your `PATH` — see Installation below (or run it by path, e.g. `./curfew`).
+
+## Installation
+
+There's no packaging/build step — `curfew` is a single script that finds its bundled `profiles/`
+directory relative to its own real location (following symlinks), so a symlink onto your `PATH`
+is enough:
+
+```sh
+ln -s "$(pwd)/curfew" ~/.local/bin/curfew   # from inside this repo; ~/.local/bin must be on PATH
+```
+
+Update by `git pull`ing this repo — the symlink always points at the current checkout, no
+reinstall needed. To uninstall: `rm ~/.local/bin/curfew`.
 
 ## 1. Create a profile
 
