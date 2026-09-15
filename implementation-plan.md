@@ -1,13 +1,13 @@
 # curfew — Implementation Plan
 
-Implements the specification in [specs.md](specs.md). This is a single bash script (`curfew`, at
-the repo root) with no build step; this document records the mechanism behind the
-profiles-with-inheritance feature, for anyone changing it later.
+`curfew` is a single bash script (at the repo root) with no build step; this document records
+the mechanism behind the profiles-with-inheritance feature, for anyone changing it later. See
+[README.md](README.md) for user-facing usage.
 
 An earlier version of this document described a from-scratch Python rewrite (fetch/parse
 blocklists directly, `python-hosts` for merging, `nosudo` as a library, a JSON state file). That
-plan was rejected — see specs.md's intro — in favor of the mechanism below, which keeps `hblock`
-and the `nosudo` CLI as subprocess dependencies and adds inheritance as a thin layer on top.
+plan was rejected in favor of the mechanism below, which keeps `hblock` and the `nosudo` CLI as
+subprocess dependencies and adds inheritance as a thin layer on top.
 
 ---
 
