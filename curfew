@@ -2,12 +2,15 @@
 # curfew — apply an hblock website-blocking profile, then lock yourself out of
 # sudo via nosudo so the block can't be undone before it lifts.
 #
-# hblock's blocklist is written to the TOP of /etc/hosts, with your existing
-# /etc/hosts content preserved verbatim below it (via hblock's -F/--footer,
-# which includes the file as-is with no parsing). Since /etc/hosts resolution
-# honors the first matching entry for a given name, the blocklist wins for
-# any domain you'd already mapped yourself, while everything else you had
-# stays intact for the curfew's duration. curfew backs up the original
+# Your existing /etc/hosts content is written to the TOP of the new file
+# (via hblock's -H/--header, which includes the given file as-is with no
+# parsing), with hblock's generated blocklist below it — purely for
+# readability when inspecting /etc/hosts during the curfew. Since
+# /etc/hosts resolution honors the first matching entry for a given name,
+# this means any domain you'd already mapped yourself, before the curfew,
+# wins over the blocklist and is NOT blocked for that domain; everything
+# else stays blocked as normal for the curfew's duration. curfew backs up
+# the original
 # /etc/hosts first and restores it automatically when the curfew ends via its
 # own reboot-safe systemd timer — the same pattern nosudo itself uses to
 # restore sudo (see scheduler.py). Only one curfew hosts-block can be active
@@ -319,10 +322,10 @@ cmd_apply() {
   # right before this function returns successfully.
   trap cleanup_hosts_block EXIT
 
-  # -F (footer) appends the pre-curfew /etc/hosts verbatim, below the
-  # blocklist, so it's preserved while the blocklist still wins on conflicts
-  # (see the file-header comment for why).
-  hblock_args+=(-O /etc/hosts -H none -F "$HOSTS_BACKUP")
+  # -H (header) prepends the pre-curfew /etc/hosts verbatim, above the
+  # blocklist, purely for readability (see the file-header comment for the
+  # resulting first-match-wins caveat).
+  hblock_args+=(-O /etc/hosts -H "$HOSTS_BACKUP" -F none)
 
   echo "curfew: applying profile '$profile' via hblock..."
   if ! sudo hblock "${hblock_args[@]}"; then

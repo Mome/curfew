@@ -138,13 +138,15 @@ What this does, in order:
 
 1. Backs up your current `/etc/hosts` to `/var/lib/curfew/hosts.bak`.
 2. Resolves the profile's full inheritance chain and merges every ancestor's lists together.
-3. Runs `hblock` with the merged lists, writing the blocklist to the top of `/etc/hosts` and
-   your original `/etc/hosts` content back in below it — so anything you already had there (e.g.
-   local dev hostnames, VPN entries) still resolves, *except* for domains that are also on the
-   blocklist, which the blocklist wins for.
-4. Runs `nosudo restrict` to lock your own `sudo` access for the given duration.
-5. Installs a reboot-safe systemd timer that restores your original `/etc/hosts` automatically
-   at the same time your `sudo` access comes back — you don't do anything to end the curfew.
+3. Runs `hblock` with the merged lists, writing your original `/etc/hosts` content back to the
+   top of `/etc/hosts` (for readability) and the blocklist below it — so anything you already had
+   there (e.g. local dev hostnames, VPN entries) still resolves, *including*, since `/etc/hosts`
+   matches first-entry-wins, any domain you'd already mapped yourself that's also on the
+   blocklist — that one domain won't be blocked for the curfew's duration.
+4. Installs a reboot-safe systemd timer that will restore your original `/etc/hosts` at the same
+   time your `sudo` access comes back.
+5. Runs `nosudo restrict` to lock your own `sudo` access for the given duration — the last step,
+   since installing the restore timer above still needs a few `sudo` calls of its own.
 
 Expect a password prompt (`nosudo restrict` re-execs under `sudo`).
 
