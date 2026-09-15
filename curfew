@@ -58,6 +58,14 @@ SYSTEMD_DIR="/etc/systemd/system"
 RESTORE_SERVICE="curfew-restore-hosts.service"
 RESTORE_TIMER="curfew-restore-hosts.timer"
 
+# Set by cmd_apply and read by its EXIT trap (cleanup_merge_dir/
+# cleanup_hosts_block below). Deliberately NOT `local`: an EXIT trap always
+# runs after every function on the call stack — including the one that
+# declared the variable — has already returned, so a `local` here would be
+# unset (and, under `set -u`, fatal) by the time the trap fires, even on a
+# perfectly successful run.
+merge_dir=""
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -268,7 +276,6 @@ cmd_apply() {
   local -a chain_dirs
   mapfile -t chain_dirs <<<"$chain_output"
 
-  local merge_dir
   merge_dir="$(mktemp -d "${TMPDIR:-/tmp}/curfew.XXXXXX")"
   trap 'rm -rf "$merge_dir"' EXIT
 
@@ -290,9 +297,27 @@ cmd_apply() {
   local target_user
   target_user="$(resolve_target_user "$@")"
 
+  # Resolve the lift time `nosudo restrict "$@"` will use *before* touching
+  # anything privileged, via nosudo's own --dry-run (no root, no side
+  # effects — see nosudo's cli.py: --dry-run skips both the sudo re-exec and
+  # every actual mutation). install_hosts_restore_timer below still needs
+  # several plain `sudo` calls of its own, and those must happen while we
+  # still have sudo: `nosudo restrict`, run last, is what takes it away.
+  local lift_at
+  if ! lift_at="$(resolve_lift_time_preview "$target_user" "$@")"; then
+    echo "curfew: could not resolve the lift time for '$*' — see nosudo's error above" >&2
+    exit 1
+  fi
+
   echo "curfew: backing up /etc/hosts to $HOSTS_BACKUP..."
   sudo mkdir -p "$STATE_DIR"
   sudo cp -p /etc/hosts "$HOSTS_BACKUP"
+
+  # From here on /etc/hosts (and, once installed, the restore timer) must be
+  # rolled back on any failure; nothing above this line touched /etc/hosts.
+  # Replaces the plain merge_dir-only trap above; downgraded back to it
+  # right before this function returns successfully.
+  trap cleanup_hosts_block EXIT
 
   # -F (footer) appends the pre-curfew /etc/hosts verbatim, below the
   # blocklist, so it's preserved while the blocklist still wins on conflicts
@@ -301,26 +326,59 @@ cmd_apply() {
 
   echo "curfew: applying profile '$profile' via hblock..."
   if ! sudo hblock "${hblock_args[@]}"; then
-    echo "curfew: hblock failed; removing hosts backup" >&2
-    sudo rm -f "$HOSTS_BACKUP"
-    exit 1
-  fi
-
-  echo "curfew: locking sudo via nosudo..."
-  if ! nosudo restrict "$@"; then
-    echo "curfew: nosudo restrict failed; reverting /etc/hosts" >&2
-    sudo cp -f "$HOSTS_BACKUP" /etc/hosts
-    sudo rm -f "$HOSTS_BACKUP"
+    echo "curfew: hblock failed" >&2
     exit 1
   fi
 
   echo "curfew: scheduling automatic /etc/hosts restore..."
-  install_hosts_restore_timer "$target_user"
+  install_hosts_restore_timer "$target_user" "$lift_at"
+
+  echo "curfew: locking sudo via nosudo..."
+  if ! nosudo restrict "$@"; then
+    echo "curfew: nosudo restrict failed" >&2
+    exit 1
+  fi
+
+  trap 'rm -rf "$merge_dir"' EXIT
+}
+
+# Reverses whatever of the hosts-block/restore-timer setup got far enough to
+# need reversing, then falls through to the plain merge_dir cleanup. Only
+# installed as the EXIT trap once /etc/hosts has actually been backed up
+# (see cmd_apply); anything that fails before that point has nothing to
+# undo.
+cleanup_hosts_block() {
+  echo "curfew: failed partway through; reverting /etc/hosts and any partial restore-timer setup" >&2
+  sudo systemctl stop "$RESTORE_TIMER" 2>/dev/null || true
+  sudo systemctl disable "$RESTORE_TIMER" 2>/dev/null || true
+  sudo rm -f "$SYSTEMD_DIR/$RESTORE_TIMER" "$SYSTEMD_DIR/$RESTORE_SERVICE" "$RESTORE_SCRIPT"
+  sudo systemctl daemon-reload 2>/dev/null || true
+  sudo cp -f "$HOSTS_BACKUP" /etc/hosts
+  sudo rm -f "$HOSTS_BACKUP"
+  rm -rf "$merge_dir"
+}
+
+# Asks `nosudo --dry-run restrict` what absolute lift time "$@" (the same
+# args cmd_apply will later pass to a real `nosudo restrict`) resolves to,
+# without restricting anything — --dry-run needs no root and performs no
+# mutations (see nosudo's cli.py/runner.py), so this is safe to call before
+# any privileged work has happened.
+resolve_lift_time_preview() {
+  local user="$1"; shift
+  local out
+  out="$(nosudo --dry-run restrict "$@")" || return 1
+  local line
+  line="$(grep -E "^${user}: sudo restricted until " <<<"$out" || true)"
+  if [[ -z "$line" ]]; then
+    echo "curfew: could not find '$user' in nosudo --dry-run restrict's output" >&2
+    return 1
+  fi
+  sed -E 's/.*restricted until ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) .*/\1/' <<<"$line"
 }
 
 # Best-effort match for nosudo's own user resolution (arg, else SUDO_USER,
-# else invoking user) so the restore timer is keyed off the same lift time
-# `nosudo restrict "$@"` just computed.
+# else invoking user) so the restore timer is keyed off the same user
+# `nosudo restrict "$@"` will act on.
 resolve_target_user() {
   local first="${1:-}"
   if [[ -n "$first" && "$first" != --* ]]; then
@@ -331,20 +389,13 @@ resolve_target_user() {
 }
 
 # Installs a reboot-safe systemd timer that restores $HOSTS_BACKUP over
-# /etc/hosts at the user's nosudo lift time, then cleans up after itself —
-# the same pattern nosudo uses to restore sudo (see scheduler.py).
+# /etc/hosts at lift_at, then cleans up after itself — the same pattern
+# nosudo uses to restore sudo (see scheduler.py). Called with sudo still
+# intact, before `nosudo restrict` takes it away (see cmd_apply); lift_at is
+# resolved ahead of time by resolve_lift_time_preview rather than read back
+# from `nosudo status` here, since by this point restrict hasn't run yet.
 install_hosts_restore_timer() {
-  local user="$1"
-  local status_line lift_at
-
-  status_line="$(nosudo status | grep "^${user}: " || true)"
-  if [[ -z "$status_line" ]]; then
-    echo "curfew: could not read nosudo's lift time for '$user';" >&2
-    echo "curfew: /etc/hosts restore was NOT scheduled — restore it yourself" >&2
-    echo "curfew: when the curfew ends with: sudo cp $HOSTS_BACKUP /etc/hosts" >&2
-    return 1
-  fi
-  lift_at="$(sed -E 's/.*lifts at ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) .*/\1/' <<<"$status_line")"
+  local user="$1" lift_at="$2"
 
   sudo tee "$RESTORE_SCRIPT" >/dev/null <<EOF
 #!/bin/sh
