@@ -61,7 +61,7 @@ end
 function __curfew_after_profile
     set -l cmd (commandline -opc)
     test (count $cmd) -ge 2
-    and not contains -- "$cmd[2]" --list --new --help
+    and not contains -- "$cmd[2]" --list --new --detect-games --help
     and not __curfew_prev_is_time_flag
 end
 
@@ -70,6 +70,7 @@ complete -c curfew -f
 complete -c curfew -n __curfew_first_arg -a '(__curfew_profile_names)' -d profile
 complete -c curfew -n __curfew_first_arg -l list -d 'List available profiles'
 complete -c curfew -n __curfew_first_arg -l new -d 'Scaffold a new profile'
+complete -c curfew -n __curfew_first_arg -l detect-games -d 'Preview which installed games would be blocked'
 complete -c curfew -n __curfew_first_arg -l help -d 'Show help'
 
 complete -c curfew -n __curfew_from_flag_position -l from -d 'Comma-separated parent profiles'

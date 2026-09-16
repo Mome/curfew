@@ -38,7 +38,7 @@ _curfew() {
   COMPREPLY=()
 
   if [[ "$COMP_CWORD" -eq 1 ]]; then
-    COMPREPLY=($(compgen -W "$(_curfew_profile_names) --list --new --help" -- "$cur"))
+    COMPREPLY=($(compgen -W "$(_curfew_profile_names) --list --new --detect-games --help" -- "$cur"))
     return
   fi
 
@@ -51,7 +51,7 @@ _curfew() {
       fi
       return
       ;;
-    --list | --help)
+    --list | --detect-games | --help)
       return
       ;;
   esac

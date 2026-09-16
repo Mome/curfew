@@ -86,6 +86,7 @@ assert_contains "first word offers user profiles" "work" "${COMPREPLY[@]}"
 assert_contains "first word offers builtin profiles" "games" "${COMPREPLY[@]}"
 assert_contains "first word offers --list" "--list" "${COMPREPLY[@]}"
 assert_contains "first word offers --new" "--new" "${COMPREPLY[@]}"
+assert_contains "first word offers --detect-games" "--detect-games" "${COMPREPLY[@]}"
 
 complete_at 1 curfew "ga"
 assert_contains "prefix 'ga' matches games" "games" "${COMPREPLY[@]}"
@@ -108,6 +109,9 @@ assert_empty "no suggestions for the duration value" "${COMPREPLY[@]}"
 
 complete_at 3 curfew "--new" "focus" ""
 assert_contains "after --new <name>, offers --from" "--from" "${COMPREPLY[@]}"
+
+complete_at 2 curfew "--detect-games" ""
+assert_empty "--detect-games takes no further arguments" "${COMPREPLY[@]}"
 
 complete_at 1 curfew "--n"
 assert_contains "'--n' still matches --new" "--new" "${COMPREPLY[@]}"

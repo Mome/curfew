@@ -90,6 +90,7 @@ complete_for "$TEST_CMD --"
 assert_contains "'--' offers --list" "--list"
 assert_contains "'--' offers --new" "--new"
 assert_contains "'--' offers --help" "--help"
+assert_contains "'--' offers --detect-games" "--detect-games"
 
 complete_for "$TEST_CMD work --"
 assert_contains "after profile, '--' offers --for" "--for"
@@ -103,6 +104,9 @@ assert_empty "no more flag suggestions right after --for"
 
 complete_for "$TEST_CMD work --for 2h"
 assert_empty "no suggestions for the duration value"
+
+complete_for "$TEST_CMD --detect-games --"
+assert_empty "--detect-games takes no further arguments"
 
 complete_for "$TEST_CMD --new foo --"
 assert_contains "after --new <name>, offers --from" "--from"
