@@ -34,6 +34,13 @@
 # (parents.list) is live: editing a parent profile later affects every
 # profile that inherits from it, since the chain is resolved fresh on every
 # `curfew <profile> --for/--until`.
+#
+# A profile can also contain an empty `block-games` file (inherited the same
+# way): installed games are then detected and locked — chowned to root,
+# chmod 000, snaps disabled — for the curfew's duration, and unlocked by the
+# same restore timer. `curfew --detect-games` previews what would be locked.
+# See "Lock installed games" in the README, and the detection/blocking
+# sections below.
 
 set -euo pipefail
 
@@ -53,16 +60,23 @@ unset _curfew_source _curfew_dir
 
 BUILTIN_PROFILES_DIR="${CURFEW_BUILTIN_PROFILES_DIR:-$SCRIPT_DIR/profiles}"
 
-# Where the pre-curfew /etc/hosts and the restore timer's own files live.
-STATE_DIR="/var/lib/curfew"
+# Where the pre-curfew /etc/hosts, the installed-game undo manifest, and the
+# restore timer's own files live.
+STATE_DIR="${CURFEW_STATE_DIR:-/var/lib/curfew}"
 HOSTS_BACKUP="$STATE_DIR/hosts.bak"
-RESTORE_SCRIPT="$STATE_DIR/restore-hosts.sh"
+APPS_BACKUP="$STATE_DIR/apps.bak"
+RESTORE_SCRIPT="$STATE_DIR/restore-curfew.sh"
 SYSTEMD_DIR="/etc/systemd/system"
-RESTORE_SERVICE="curfew-restore-hosts.service"
-RESTORE_TIMER="curfew-restore-hosts.timer"
+RESTORE_SERVICE="curfew-restore.service"
+RESTORE_TIMER="curfew-restore.timer"
 
-# Set by cmd_apply and read by its EXIT trap (cleanup_merge_dir/
-# cleanup_hosts_block below). Deliberately NOT `local`: an EXIT trap always
+# Where installed games are looked for (see detect_games). Colon-separated.
+# Earlier desktop dirs shadow same-named entries in later ones, as in XDG.
+DESKTOP_DIRS="${CURFEW_DESKTOP_DIRS:-$HOME/.local/share/applications:$HOME/.local/share/flatpak/exports/share/applications:/var/lib/flatpak/exports/share/applications:/var/lib/snapd/desktop/applications:/usr/local/share/applications:/usr/share/applications}"
+STEAM_ROOTS="${CURFEW_STEAM_ROOTS:-$HOME/.local/share/Steam:$HOME/.steam/steam:$HOME/.steam/debian-installation:$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam}"
+
+# Set by cmd_apply and read by its EXIT trap (the plain merge_dir cleanup, or
+# cleanup_curfew_apply below). Deliberately NOT `local`: an EXIT trap always
 # runs after every function on the call stack — including the one that
 # declared the variable — has already returned, so a `local` here would be
 # unset (and, under `set -u`, fatal) by the time the trap fires, even on a
@@ -76,11 +90,13 @@ Usage:
   curfew <profile> --until <time>       Apply profile, lock sudo until an absolute time
   curfew --list                         List available profiles (yours, then bundled)
   curfew --new <profile> [--from a,b,c] Scaffold a new profile, optionally inheriting others
+  curfew --detect-games                 Preview which installed games block-games would lock
   curfew --help                         Show this help
 
 Profiles directory: $CURFEW_PROFILES_DIR (default: ~/.config/curfew/profiles)
 Bundled profiles:   ./profiles/ next to this script (see --list)
-Each profile is a directory containing any of: sources.list, deny.list, allow.list, parents.list
+Each profile is a directory containing any of: sources.list, deny.list, allow.list, parents.list,
+and block-games (an empty file: also lock installed games for the curfew's duration)
 EOF
 }
 
@@ -179,11 +195,440 @@ merge_profile_lists() {
   [[ "$any_file_present" -eq 1 ]]
 }
 
+# profile_chain_has_marker <marker> <dir>...: true iff any profile dir in the
+# chain has <marker>. Markers are presence-only files, so there is nothing to
+# merge — inheriting one just means "set anywhere in the chain".
+profile_chain_has_marker() {
+  local marker="$1" dir
+  shift
+  for dir in "$@"; do
+    [[ -f "$dir/$marker" ]] && return 0
+  done
+  return 1
+}
+
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
+}
+
+# -- installed-game detection -------------------------------------------------
+#
+# detect_games finds installed games from four places and prints one
+# tab-separated record per candidate:
+#   <verdict> <source> <target> <note>
+# verdict: block | skip.  source: native | flatpak | snap | steam.
+# target: the real path to lock (native binary, Flatpak deploy dir, Steam
+# install dir), or a snap name.  note: where it was found, plus why for skips.
+#
+# Packages from apt/pacman/AUR need no scanner of their own: they ship
+# .desktop files, so the native source covers them. Launchers that keep games
+# in their own databases (Lutris, Heroic, Bottles) are not covered.
+#
+# Detection never uses sudo and never changes anything; it runs as the
+# invoking user, so a false positive shows up in `curfew --detect-games`
+# before it can ever be locked.
+
+emit_game() {
+  local verdict="$1" source="$2" target="$3" note="$4"
+  if [[ "$target" == *[$'\t\n']* ]]; then
+    verdict=skip
+    target="(unprintable path)"
+    note="$note: path contains a tab or newline"
+  fi
+  note="${note//[$'\t\n']/ }"
+  printf '%s\t%s\t%s\t%s\n' "$verdict" "$source" "$target" "$note"
+}
+
+# desktop_entry_fields <file>: prints Key=Value for the keys detection cares
+# about, from the [Desktop Entry] group only — an Exec= under a
+# [Desktop Action ...] group is a secondary action, not the app itself.
+desktop_entry_fields() {
+  awk '
+    BEGIN { split("Categories Hidden Exec Name X-Flatpak X-SnapInstanceName", keys, " ")
+            for (i in keys) want[keys[i]] = 1 }
+    { sub(/\r$/, "") }
+    /^\[/ { in_main = ($0 == "[Desktop Entry]"); next }
+    in_main {
+      eq = index($0, "="); if (!eq) next
+      key = substr($0, 1, eq - 1); sub(/[ \t]+$/, "", key)
+      if ((key in want) && !(key in seen)) {
+        seen[key] = 1
+        val = substr($0, eq + 1); sub(/^[ \t]+/, "", val)
+        print key "=" val
+      }
+    }
+  ' "$1"
+}
+
+# desktop_exec_program <exec>: the program an Exec= value runs — its first
+# token (a leading "double-quoted" token may contain spaces), looking past a
+# leading `env VAR=value ...` wrapper.
+desktop_exec_program() {
+  local exec="$1" prog rest word
+  if [[ "$exec" == \"* ]]; then
+    prog="${exec#\"}"
+    prog="${prog%%\"*}"
+    rest="${exec#\"*\"}"
+  else
+    prog="${exec%%[[:space:]]*}"
+    rest="${exec#"$prog"}"
+  fi
+  if [[ "$prog" == env ]]; then
+    local -a words
+    read -ra words <<<"$rest"
+    for word in "${words[@]}"; do
+      [[ "$word" == *=* ]] && continue
+      prog="$word"
+      break
+    done
+  fi
+  printf '%s' "$prog"
+}
+
+# Programs that run *other* programs. Locking one would break far more than
+# a game, so an entry launching through one is never locked.
+is_launcher_program() {
+  case "$1" in
+    env | sh | bash | dash | zsh | fish | python | python[23]* | perl | perl5* | ruby | ruby[0-9]* \
+      | java | javaw | lua | luajit | lua5* | node | mono | wine | wine64 | wine-* | proton* \
+      | flatpak | snap | steam | xdg-open | gio | gtk-launch | kde-open* | exo-open | gamemoderun \
+      | gamescope | mangohud | prime-run | lutris | heroic | bottles* | playonlinux | itch \
+      | legendary | minigalaxy | sudo | pkexec | systemd-run | dbus-*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# normalized_name <s>: lowercase alphanumerics, trailing digits dropped
+# ("SuperTux2" -> "supertux").
+normalized_name() {
+  local s="${1,,}"
+  s="${s//[^a-z0-9]/}"
+  s="${s%"${s##*[!0-9]}"}"
+  printf '%s' "$s"
+}
+
+# A binary in /usr/bin is only trusted as a game when it is named after the
+# desktop entry (its id, the id's last dotted part, or its Name=) — packaged
+# games there usually are, while a misfiring entry pointing at some shared
+# tool almost never is.
+binary_named_after_entry() {
+  local bin id="${2%.desktop}" name="$3"
+  bin="$(normalized_name "$1")"
+  [[ "${#bin}" -ge 3 ]] || return 1
+  [[ "$bin" == "$(normalized_name "$id")" \
+    || "$bin" == "$(normalized_name "${id##*.}")" \
+    || "$bin" == "$(normalized_name "$name")" ]]
+}
+
+# protected_path_reason <real-path>: prints why this path must never be
+# locked, or nothing if it may be. Files directly in /usr/bin and
+# /usr/local/bin pass here; callers apply binary_named_after_entry to them.
+protected_path_reason() {
+  local t="$1" home depth
+  home="$(realpath -e "$HOME" 2>/dev/null || printf '%s' "$HOME")"
+  if [[ "$t" == / || "$home/" == "$t/"* ]]; then
+    printf 'contains your home directory'
+    return 0
+  fi
+  [[ "$t" == "$home"/?* ]] && return 0
+  case "$t" in
+    /usr/games/?* | /usr/local/games/?* | /usr/share/games/?* | /usr/lib/games/?* \
+      | /usr/lib64/games/?* | /var/lib/flatpak/app/?*)
+      return 0
+      ;;
+    /usr/bin | /usr/local/bin | /bin/* | /sbin/* | /lib/* | /lib32/* | /lib64/* | /usr/sbin/* \
+      | /usr/lib/* | /usr/lib32/* | /usr/lib64/* | /usr/libexec/* | /usr/share/* | /usr/local/sbin/* \
+      | /usr/local/lib/* | /etc/* | /boot/* | /proc/* | /sys/* | /dev/* | /run/* | /var/* | /snap/*)
+      printf 'system path'
+      return 0
+      ;;
+  esac
+  depth="${t//[^\/]/}"
+  if [[ -d "$t" && "${#depth}" -lt 3 ]]; then
+    printf 'directory too close to the filesystem root'
+  fi
+  return 0
+}
+
+classify_desktop_game() {
+  local file="$1" name="$2" exec="$3" flatpak_id="$4" snap_name="$5"
+  local label prog resolved target reason
+  label="$(basename "$file")"
+
+  if [[ -n "$snap_name" ]]; then
+    if [[ ! "$snap_name" =~ ^[a-z0-9][a-z0-9-]*(_[a-z0-9]+)?$ ]]; then
+      emit_game skip snap "$snap_name" "$label: invalid snap name"
+    elif ! command -v snap >/dev/null 2>&1; then
+      emit_game skip snap "$snap_name" "$label: snap command not found"
+    else
+      emit_game block snap "$snap_name" "$label"
+    fi
+    return 0
+  fi
+
+  if [[ -n "$flatpak_id" ]]; then
+    local app_dir="${file%/exports/share/applications/*}/app/$flatpak_id"
+    if [[ ! "$flatpak_id" =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$ ]]; then
+      emit_game skip flatpak "$flatpak_id" "$label: invalid Flatpak app id"
+    elif [[ "$file" != */exports/share/applications/* ]] \
+      || ! target="$(realpath -e "$app_dir" 2>/dev/null)" || [[ ! -d "$target" ]]; then
+      emit_game skip flatpak "$app_dir" "$label: Flatpak deploy directory not found"
+    else
+      reason="$(protected_path_reason "$target")"
+      if [[ -n "$reason" ]]; then
+        emit_game skip flatpak "$target" "$label: $reason"
+      else
+        emit_game block flatpak "$target" "$label"
+      fi
+    fi
+    return 0
+  fi
+
+  prog="$(desktop_exec_program "$exec")"
+  if [[ -z "$prog" ]]; then
+    emit_game skip native "(no Exec=)" "$label: no program to lock"
+    return 0
+  fi
+  if is_launcher_program "${prog##*/}"; then
+    emit_game skip native "$prog" "$label: launches through ${prog##*/}"
+    return 0
+  fi
+  if [[ "$prog" != /* ]]; then
+    resolved="$(command -v "$prog" 2>/dev/null || true)"
+    if [[ "$resolved" != /* ]]; then
+      emit_game skip native "$prog" "$label: not found on PATH"
+      return 0
+    fi
+    prog="$resolved"
+  fi
+  if ! target="$(realpath -e "$prog" 2>/dev/null)" || [[ ! -f "$target" ]]; then
+    emit_game skip native "$prog" "$label: not an existing file"
+    return 0
+  fi
+  if is_launcher_program "${target##*/}"; then
+    emit_game skip native "$target" "$label: launches through ${target##*/}"
+    return 0
+  fi
+  reason="$(protected_path_reason "$target")"
+  if [[ -z "$reason" && ( "$target" == /usr/bin/* || "$target" == /usr/local/bin/* ) ]] \
+    && ! binary_named_after_entry "${target##*/}" "$label" "$name"; then
+    reason="system binary not named after the game"
+  fi
+  if [[ -n "$reason" ]]; then
+    emit_game skip native "$target" "$label: $reason"
+  else
+    emit_game block native "$target" "$label"
+  fi
+}
+
+scan_desktop_games() {
+  local -A seen_ids=()
+  local -a dirs
+  local dir file id key value categories hidden exec name flatpak_id snap_name
+  local game_re='(^|;)[A-Za-z]*Game(;|$)'
+  IFS=: read -ra dirs <<<"$DESKTOP_DIRS"
+  for dir in "${dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for file in "$dir"/*.desktop; do
+      [[ -f "$file" ]] || continue
+      id="$(basename "$file")"
+      [[ -z "${seen_ids[$id]:-}" ]] || continue
+      seen_ids[$id]=1
+      categories="" hidden="" exec="" name="" flatpak_id="" snap_name=""
+      while IFS='=' read -r key value; do
+        case "$key" in
+          Categories) categories="$value" ;;
+          Hidden) hidden="$value" ;;
+          Exec) exec="$value" ;;
+          Name) name="$value" ;;
+          X-Flatpak) flatpak_id="$value" ;;
+          X-SnapInstanceName) snap_name="$value" ;;
+        esac
+      done < <(desktop_entry_fields "$file")
+      [[ "$categories" =~ $game_re ]] || continue
+      [[ "$hidden" != true ]] || continue
+      classify_desktop_game "$file" "$name" "$exec" "$flatpak_id" "$snap_name"
+    done
+  done
+}
+
+# steam_library_dirs: real paths of every Steam library's steamapps dir —
+# each root in $STEAM_ROOTS plus the libraries its libraryfolders.vdf lists,
+# in either the current nested schema ("path" "...") or the older flat one
+# ("1" "/path").
+steam_library_dirs() {
+  local -A seen=()
+  local -a roots libs
+  local root lib real
+  IFS=: read -ra roots <<<"$STEAM_ROOTS"
+  for root in "${roots[@]}"; do
+    [[ -d "$root/steamapps" ]] || continue
+    libs=("$root")
+    if [[ -f "$root/steamapps/libraryfolders.vdf" ]]; then
+      mapfile -t -O 1 libs < <(sed -nE \
+        -e 's/^[[:space:]]*"path"[[:space:]]+"(.*)"[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*"[0-9]+"[[:space:]]+"(\/.*)"[[:space:]]*$/\1/p' \
+        "$root/steamapps/libraryfolders.vdf" | sed 's/\\\\/\\/g')
+    fi
+    for lib in "${libs[@]}"; do
+      real="$(realpath -e "$lib/steamapps" 2>/dev/null)" || continue
+      [[ -z "${seen[$real]:-}" ]] || continue
+      seen[$real]=1
+      printf '%s\n' "$real"
+    done
+  done
+}
+
+acf_value() {
+  sed -nE "s/^[[:space:]]*\"$2\"[[:space:]]+\"(.*)\"[[:space:]]*\$/\\1/Ip" "$1" | head -n 1
+}
+
+scan_steam_games() {
+  local steamapps acf name installdir dir target reason
+  while IFS= read -r steamapps; do
+    for acf in "$steamapps"/appmanifest_*.acf; do
+      [[ -f "$acf" ]] || continue
+      name="$(acf_value "$acf" name)"
+      installdir="$(acf_value "$acf" installdir)"
+      [[ -n "$name" ]] || name="$(basename "$acf")"
+      dir="$steamapps/common/$installdir"
+      if [[ -z "$installdir" || "$installdir" == */* || "$installdir" == . || "$installdir" == .. ]]; then
+        emit_game skip steam "$dir" "$name: unusable installdir"
+        continue
+      fi
+      # Compatibility tools serve every game; locking one breaks the others.
+      if [[ "$name" =~ ^(Proton|Steam\ Linux\ Runtime|Steamworks\ Common\ Redistributables) ]]; then
+        emit_game skip steam "$dir" "$name: Steam compatibility tool"
+        continue
+      fi
+      if ! target="$(realpath -e "$dir" 2>/dev/null)" || [[ ! -d "$target" ]]; then
+        emit_game skip steam "$dir" "$name: install directory not found"
+        continue
+      fi
+      reason="$(protected_path_reason "$target")"
+      if [[ -n "$reason" ]]; then
+        emit_game skip steam "$target" "$name: $reason"
+      else
+        emit_game block steam "$target" "$name"
+      fi
+    done
+  done < <(steam_library_dirs)
+}
+
+# detect_games: every scanner's records, with repeat "block" targets (e.g. two
+# desktop entries for one binary) collapsed to the first.
+detect_games() {
+  local -A seen=()
+  local verdict source target note key
+  while IFS=$'\t' read -r verdict source target note; do
+    if [[ "$verdict" == block ]]; then
+      key="$([[ "$source" == snap ]] && echo snap || echo path):$target"
+      [[ -z "${seen[$key]:-}" ]] || continue
+      seen[$key]=1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$verdict" "$source" "$target" "$note"
+  done < <(scan_desktop_games; scan_steam_games)
+}
+
+# -- installed-game blocking ----------------------------------------------------
+#
+# $APPS_BACKUP holds one undo entry per line. Two loops replay it and must
+# stay in sync with this contract: restore_apps_backup (failure rollback,
+# bash) and the restore script generated by install_restore_timer (sh, run by
+# systemd when the curfew lifts).
+#   perm <uid>:<gid> <octal-mode> <path>   chown, then chmod, <path> back
+#   snap <name>                            snap enable <name>
+# <path> comes last so it may contain spaces. Recorded paths are real paths,
+# and both loops skip a path whose real path no longer matches: undoing runs
+# as root over paths in user-writable directories (a Steam library, ~/Games),
+# so a locked path swapped for a symlink — or under a swapped parent — must
+# never make root chown or chmod whatever it now points at.
+#
+# A locked path is chowned to root as well as chmod 000: a plain chmod on a
+# file you own (a Steam library in $HOME, an AppImage) is undone with your
+# own `chmod`, no sudo needed, and a merely non-executable file can still be
+# copied and run. Each entry is recorded *before* its change is made, since
+# replaying the original owner and mode onto an unchanged path is harmless,
+# whereas a change the manifest doesn't know about would outlive the curfew.
+
+record_apps_backup_entry() {
+  printf '%s\n' "$1" | sudo tee -a "$APPS_BACKUP" >/dev/null
+}
+
+detect_and_block_games() {
+  local records verdict source target note current i
+  local -a sources=() targets=() notes=() originals=()
+  records="$(detect_games)"
+
+  # Read every original owner/mode first: once a directory is locked, paths
+  # inside it can no longer be stat'ed by the invoking user.
+  while IFS=$'\t' read -r verdict source target note; do
+    [[ -n "$verdict" ]] || continue
+    if [[ "$verdict" != block ]]; then
+      echo "curfew:   not locking $target ($note)"
+      continue
+    fi
+    if [[ "$source" == snap ]]; then
+      current=""
+    elif ! current="$(stat -c '%u:%g %a' "$target")"; then
+      echo "curfew: could not read the current owner and mode of $target" >&2
+      exit 1
+    fi
+    sources+=("$source")
+    targets+=("$target")
+    notes+=("$note")
+    originals+=("$current")
+  done <<<"$records"
+
+  for i in "${!targets[@]}"; do
+    target="${targets[i]}"
+    if [[ "${sources[i]}" == snap ]]; then
+      record_apps_backup_entry "snap $target"
+      if ! sudo snap disable "$target" >/dev/null; then
+        echo "curfew: could not disable snap '$target'" >&2
+        exit 1
+      fi
+    else
+      record_apps_backup_entry "perm ${originals[i]} $target"
+      if ! sudo chown root:root "$target" || ! sudo chmod 000 "$target"; then
+        echo "curfew: could not lock $target" >&2
+        exit 1
+      fi
+      # NTFS/exFAT mounts accept chown/chmod without applying them.
+      if [[ "$(sudo stat -c '%a' "$target" 2>/dev/null)" != 0 ]]; then
+        echo "curfew:   warning: $target is NOT locked — its filesystem ignores Unix permissions (NTFS/exFAT?)" >&2
+        continue
+      fi
+    fi
+    echo "curfew:   locked ${notes[i]} ($target)"
+  done
+}
+
+# Undoes every entry in $APPS_BACKUP, best-effort, then removes it.
+restore_apps_backup() {
+  sudo test -f "$APPS_BACKUP" || return 0
+  local kind a b c
+  while IFS=' ' read -r kind a b c; do
+    case "$kind" in
+      perm)
+        if [[ "$(sudo realpath -e "$c" 2>/dev/null)" != "$c" ]]; then
+          echo "curfew: not restoring $c: it was moved or replaced" >&2
+          continue
+        fi
+        sudo chown -h "$a" "$c" 2>/dev/null || true
+        sudo chmod "$b" "$c" 2>/dev/null || true
+        ;;
+      snap)
+        sudo snap enable "$a" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(sudo cat "$APPS_BACKUP")
+  sudo rm -f "$APPS_BACKUP"
 }
 
 # -- commands ----------------------------------------------------------------
@@ -194,6 +639,7 @@ describe_profile_dir() {
   [[ -f "$dir/sources.list" ]] && parts+=("sources")
   [[ -f "$dir/deny.list" ]] && parts+=("deny")
   [[ -f "$dir/allow.list" ]] && parts+=("allow")
+  [[ -f "$dir/block-games" ]] && parts+=("games-block")
   printf '  %-20s %s\n' "$name" "${parts[*]:-<empty>}"
   mapfile -t parents_arr < <(list_parents "$dir/parents.list")
   [[ "${#parents_arr[@]}" -gt 0 ]] && printf '  %-20s   from: %s\n' "" "${parents_arr[*]}"
@@ -221,6 +667,31 @@ cmd_list() {
       describe_profile_dir "$dir"
     done
   fi
+}
+
+cmd_detect_games() {
+  local records source label verdict src target note any
+  records="$(detect_games)"
+  echo "Installed games a curfew would lock if its profile has a 'block-games' file:"
+  for source in native flatpak snap steam; do
+    case "$source" in
+      native) label="Desktop entries (distro packages, AppImages, other installs)" ;;
+      flatpak) label="Flatpak" ;;
+      snap) label="Snap" ;;
+      steam) label="Steam" ;;
+    esac
+    echo
+    echo "$label:"
+    any=0
+    while IFS=$'\t' read -r verdict src target note; do
+      [[ "$src" == "$source" ]] || continue
+      any=1
+      printf '  %-5s  %s  (%s)\n' "$verdict" "$target" "$note"
+    done <<<"$records"
+    [[ "$any" -eq 1 ]] || echo "  (none found)"
+  done
+  echo
+  echo "Nothing was changed. Only 'block' entries are locked; 'skip' entries never are."
 }
 
 cmd_new() {
@@ -290,6 +761,9 @@ cmd_apply() {
   merge_profile_lists "$merge_dir/allow.list" allow.list "${chain_dirs[@]}" \
     && hblock_args+=(-A "$merge_dir/allow.list")
 
+  local games_block_enabled=0
+  profile_chain_has_marker block-games "${chain_dirs[@]}" && games_block_enabled=1
+
   if sudo test -f "$HOSTS_BACKUP"; then
     echo "curfew: a curfew hosts-block is already active ($HOSTS_BACKUP exists);" >&2
     echo "curfew: refusing to apply another profile on top of it — wait for it" >&2
@@ -303,7 +777,7 @@ cmd_apply() {
   # Resolve the lift time `nosudo restrict "$@"` will use *before* touching
   # anything privileged, via nosudo's own --dry-run (no root, no side
   # effects — see nosudo's cli.py: --dry-run skips both the sudo re-exec and
-  # every actual mutation). install_hosts_restore_timer below still needs
+  # every actual mutation). install_restore_timer below still needs
   # several plain `sudo` calls of its own, and those must happen while we
   # still have sudo: `nosudo restrict`, run last, is what takes it away.
   local lift_at
@@ -320,7 +794,7 @@ cmd_apply() {
   # rolled back on any failure; nothing above this line touched /etc/hosts.
   # Replaces the plain merge_dir-only trap above; downgraded back to it
   # right before this function returns successfully.
-  trap cleanup_hosts_block EXIT
+  trap cleanup_curfew_apply EXIT
 
   # -H (header) prepends the pre-curfew /etc/hosts verbatim, above the
   # blocklist, purely for readability (see the file-header comment for the
@@ -333,8 +807,13 @@ cmd_apply() {
     exit 1
   fi
 
-  echo "curfew: scheduling automatic /etc/hosts restore..."
-  install_hosts_restore_timer "$target_user" "$lift_at"
+  if [[ "$games_block_enabled" -eq 1 ]]; then
+    echo "curfew: profile has block-games; locking installed games..."
+    detect_and_block_games
+  fi
+
+  echo "curfew: scheduling automatic restore..."
+  install_restore_timer "$target_user" "$lift_at"
 
   echo "curfew: locking sudo via nosudo..."
   if ! nosudo restrict "$@"; then
@@ -345,17 +824,18 @@ cmd_apply() {
   trap 'rm -rf "$merge_dir"' EXIT
 }
 
-# Reverses whatever of the hosts-block/restore-timer setup got far enough to
-# need reversing, then falls through to the plain merge_dir cleanup. Only
-# installed as the EXIT trap once /etc/hosts has actually been backed up
-# (see cmd_apply); anything that fails before that point has nothing to
-# undo.
-cleanup_hosts_block() {
-  echo "curfew: failed partway through; reverting /etc/hosts and any partial restore-timer setup" >&2
+# Reverses whatever of the hosts-block/game-lock/restore-timer setup got far
+# enough to need reversing, then falls through to the plain merge_dir
+# cleanup. Only installed as the EXIT trap once /etc/hosts has actually been
+# backed up (see cmd_apply); anything that fails before that point has
+# nothing to undo.
+cleanup_curfew_apply() {
+  echo "curfew: failed partway through; reverting /etc/hosts, locked games, and any partial restore-timer setup" >&2
   sudo systemctl stop "$RESTORE_TIMER" 2>/dev/null || true
   sudo systemctl disable "$RESTORE_TIMER" 2>/dev/null || true
   sudo rm -f "$SYSTEMD_DIR/$RESTORE_TIMER" "$SYSTEMD_DIR/$RESTORE_SERVICE" "$RESTORE_SCRIPT"
   sudo systemctl daemon-reload 2>/dev/null || true
+  restore_apps_backup
   sudo cp -f "$HOSTS_BACKUP" /etc/hosts
   sudo rm -f "$HOSTS_BACKUP"
   rm -rf "$merge_dir"
@@ -392,18 +872,35 @@ resolve_target_user() {
 }
 
 # Installs a reboot-safe systemd timer that restores $HOSTS_BACKUP over
-# /etc/hosts at lift_at, then cleans up after itself — the same pattern
+# /etc/hosts and undoes $APPS_BACKUP at lift_at, then cleans up after itself — the same pattern
 # nosudo uses to restore sudo (see scheduler.py). Called with sudo still
 # intact, before `nosudo restrict` takes it away (see cmd_apply); lift_at is
 # resolved ahead of time by resolve_lift_time_preview rather than read back
 # from `nosudo status` here, since by this point restrict hasn't run yet.
-install_hosts_restore_timer() {
+install_restore_timer() {
   local user="$1" lift_at="$2"
 
+  # Unquoted EOF: $HOSTS_BACKUP etc. are baked in now; \$-escaped names are
+  # left for sh to expand when the script runs.
   sudo tee "$RESTORE_SCRIPT" >/dev/null <<EOF
 #!/bin/sh
-# Managed by curfew. Restores /etc/hosts to its pre-curfew contents. Root-owned; do not edit.
+# Managed by curfew. Restores /etc/hosts and any locked games to their pre-curfew state. Root-owned; do not edit.
 cp -f $HOSTS_BACKUP /etc/hosts
+if [ -f "$APPS_BACKUP" ]; then
+  while IFS=' ' read -r kind a b c; do
+    case "\$kind" in
+      perm)
+        if [ "\$(realpath -e "\$c" 2>/dev/null)" = "\$c" ]; then
+          chown -h "\$a" "\$c"; chmod "\$b" "\$c"
+        else
+          echo "curfew: not restoring \$c: it was moved or replaced during the curfew" >&2
+        fi
+        ;;
+      snap) snap enable "\$a" ;;
+    esac
+  done < "$APPS_BACKUP"
+  rm -f "$APPS_BACKUP"
+fi
 systemctl stop $RESTORE_TIMER 2>/dev/null || true
 systemctl disable $RESTORE_TIMER 2>/dev/null || true
 rm -f $SYSTEMD_DIR/$RESTORE_TIMER $SYSTEMD_DIR/$RESTORE_SERVICE
@@ -415,7 +912,7 @@ EOF
 
   sudo tee "$SYSTEMD_DIR/$RESTORE_SERVICE" >/dev/null <<EOF
 [Unit]
-Description=curfew: restore /etc/hosts after curfew ends
+Description=curfew: restore /etc/hosts and locked games after curfew ends
 
 [Service]
 Type=oneshot
@@ -424,7 +921,7 @@ EOF
 
   sudo tee "$SYSTEMD_DIR/$RESTORE_TIMER" >/dev/null <<EOF
 [Unit]
-Description=curfew: restore timer for /etc/hosts
+Description=curfew: restore timer for /etc/hosts and locked games
 
 [Timer]
 OnCalendar=$lift_at:00
@@ -438,7 +935,7 @@ EOF
   sudo systemctl enable "$RESTORE_TIMER"
   sudo systemctl restart "$RESTORE_TIMER"
 
-  echo "curfew: /etc/hosts will be restored automatically at $lift_at"
+  echo "curfew: everything will be restored automatically at $lift_at"
 }
 
 main() {
@@ -450,6 +947,10 @@ main() {
   case "$1" in
     --list)
       cmd_list
+      ;;
+    --detect-games)
+      [[ $# -eq 1 ]] || { echo "curfew: --detect-games takes no arguments" >&2; exit 1; }
+      cmd_detect_games
       ;;
     --new)
       [[ $# -ge 2 ]] || { echo "curfew: --new needs a profile name" >&2; exit 1; }

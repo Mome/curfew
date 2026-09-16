@@ -160,8 +160,8 @@ assert_failure "nosudo restrict failure exits nonzero" "$status"
 assert_not_contains "nosudo restrict failure: no unbound variable" "unbound variable" "$output"
 assert_contains "nosudo restrict failure: /etc/hosts is reverted" "cp -f" "$(cat "$MOCKLOG")"
 
-# The original bug report: sudo denies the `tee restore-hosts.sh` call
-# inside install_hosts_restore_timer. Must abort and clean up gracefully
+# The original bug report: sudo denies the `tee` of the restore script
+# inside install_restore_timer. Must abort and clean up gracefully
 # instead of crashing on an unrelated unbound-variable error.
 output="$(SUDO_FAIL_MATCH="tee" run_apply 2>&1)"
 status=$?

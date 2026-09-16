@@ -30,3 +30,4 @@ test:
 	bash tests/test_completion.bash
 	bash tests/test_completion_fish.sh
 	bash tests/test_apply.bash
+	bash tests/test_games_block.bash
